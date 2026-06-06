@@ -5,9 +5,9 @@ enforces **role-based access control at the vector store level**. A junior
 employee querying the system cannot retrieve C-suite documents — even with
 clever prompt-injection attempts.
 
-## Senior-level skills demonstrated
+## features demonstrated
 
-| Skill | Where it lives |
+| feature | Where it lives |
 |---|---|
 | Metadata-based filtering on the vector store | `app/services/vector_store.py` (Chroma `where` filters built from the caller's role) |
 | Guardrails against prompt injection | `app/services/guardrails.py` (input + output filters, system-prompt hardening) |
