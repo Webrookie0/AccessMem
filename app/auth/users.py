@@ -3,10 +3,11 @@ from passlib.context import CryptContext
 
 from .models import User
 
-_pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
+_pwd = CryptContext(schemes=["argon2"], deprecated="auto")
 
-# Default password for ALL demo users is "demo"
-_DEMO_HASH = _pwd.hash("demo")
+# Pre-computed argon2 hash of "demo" (does not require bcrypt backend initialization)
+_DEMO_HASH = "$argon2id$v=19$m=65536,t=3,p=4$sbZ2TskZQyjlHKMUwhiD0A$snno7uZjZ/3skALMrTVVSfNuxttxGJPfwdwA35U2Xhk"
+
 
 _USERS: dict[str, User] = {
     "alice": User(username="alice", role="junior",  tenant_id="acme",   password_hash=_DEMO_HASH),

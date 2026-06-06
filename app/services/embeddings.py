@@ -27,7 +27,23 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
             )
             response.raise_for_status()
             data = response.json()
-            embeddings.append(data.get("embedding", []))
+            
+            # Ollama returns "embeddings" (plural) as a list
+            embedding_list = data.get("embeddings")
+            if not embedding_list or len(embedding_list) == 0:
+                raise RuntimeError(
+                    f"No embeddings in Ollama response. Response: {data}\n"
+                    f"Make sure Ollama is running: ollama serve\n"
+                    f"And model is available: ollama pull {model}"
+                )
+            # Take the first embedding from the list
+            embeddings.append(embedding_list[0])
+        except requests.exceptions.ConnectionError as e:
+            raise RuntimeError(
+                f"Cannot connect to Ollama at {base_url}\n"
+                f"Error: {e}\n"
+                f"Make sure Ollama is running: ollama serve"
+            )
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Failed to get embedding from Ollama: {e}")
     
