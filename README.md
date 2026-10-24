@@ -160,6 +160,3 @@ AccessMem is a portfolio application, not a production security certification. M
 
 Embedded Chroma and in-memory BM25 suit small corpora and a single API worker. Larger deployments should use shared retrieval services with server-side permission filters, a persistent keyword index, distributed quotas, an identity provider, TLS, backups/retention, and protected storage. Further work includes a measured reranker, token-aware chunking, more adversarial evaluation data, and user/tenant-scoped conversation memory. Current chat history stays in the UI session; each backend question is independent.
 
-## Attribution and license
-
-AccessMem extends the original [Implementing Role-Based Access Control in RAG](https://github.com/saurabh-itg/Implementing-Role-Based-Access-Control-in-RAG) scaffold by Saurabh Joshi. Its Git history is preserved. The AccessMem changes add hybrid retrieval, evaluation, persistent accounts, stricter validation, ingestion lifecycle handling, tests, deployment configuration, and documentation. See [LICENSE](LICENSE) for the MIT license.
