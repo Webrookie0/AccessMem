@@ -4,6 +4,12 @@ __pycache__/
 .env
 chroma_db/
 audit.log
+audit.log.*
+accessmem_users.db*
+eval/results/
+.ruff_cache/
+.coverage
+htmlcov/
 .pytest_cache/
 *.egg-info/
 .DS_Store

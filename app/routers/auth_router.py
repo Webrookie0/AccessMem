@@ -4,12 +4,13 @@ from fastapi.security import OAuth2PasswordRequestForm
 from ..auth.jwt import create_access_token, get_current_user
 from ..auth.models import TokenResponse, User
 from ..auth.users import authenticate
+from ..rate_limit import limit_login
 from ..services.audit import log_event
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login", response_model=TokenResponse, dependencies=[Depends(limit_login)])
 def login(form: OAuth2PasswordRequestForm = Depends()) -> TokenResponse:
     user = authenticate(form.username, form.password)
     if user is None:

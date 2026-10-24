@@ -1,8 +1,11 @@
 """Domain models for users, roles, and document clearance levels."""
+
 from __future__ import annotations
 
 from enum import IntEnum
-from pydantic import BaseModel
+from typing import Literal
+
+from pydantic import BaseModel, Field
 
 
 class Clearance(IntEnum):
@@ -10,13 +13,14 @@ class Clearance(IntEnum):
 
     A user may read any document whose clearance is <= the user's clearance.
     """
+
     PUBLIC = 0
     INTERNAL = 1
     CONFIDENTIAL = 2
     RESTRICTED = 3
 
     @classmethod
-    def from_name(cls, name: str) -> "Clearance":
+    def from_name(cls, name: str) -> Clearance:
         return cls[name.upper()]
 
 
@@ -30,15 +34,14 @@ ROLE_CLEARANCE: dict[str, Clearance] = {
 
 
 class User(BaseModel):
-    username: str
-    role: str
-    tenant_id: str
-    # password_hash is NOT exposed via this model when serialised to clients
-    password_hash: str | None = None
+    username: str = Field(min_length=1, max_length=128)
+    role: Literal["junior", "manager", "csuite", "admin"]
+    tenant_id: str = Field(min_length=1, max_length=128)
+    password_hash: str | None = Field(default=None, exclude=True, repr=False)
 
     @property
     def clearance(self) -> Clearance:
-        return ROLE_CLEARANCE.get(self.role, Clearance.PUBLIC)
+        return ROLE_CLEARANCE[self.role]
 
     def public_dict(self) -> dict:
         return {

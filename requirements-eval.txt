@@ -1,0 +1,9 @@
+-r requirements.txt
+ragas==0.4.3
+openai==2.54.0
+# RAGAS 0.4.3 imports legacy LangChain modules removed by 1.x / community 0.4.
+langchain==0.3.30
+langchain-core==0.3.86
+langchain-community==0.3.31
+langchain-openai==0.3.35
+langchain-text-splitters==0.3.11

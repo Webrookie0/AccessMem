@@ -1,15 +1,19 @@
-"""End-to-end RAG pipeline tying together RBAC retrieval, guardrails, and the LLM."""
+"""AccessMem question answering with authorized context and verified source IDs."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-import requests
-from functools import lru_cache
+from dataclasses import dataclass, field
+from time import perf_counter
+from typing import Literal
 
 from ..auth.models import User
+from ..auth.rbac import build_access_filter
 from ..config import get_settings
 from . import guardrails
 from .audit import log_event
-from .vector_store import RetrievedChunk, secure_search
+from .ollama import OllamaError, request_json
+from .retrieval import RetrievedChunk
+from .vector_store import secure_search
 
 
 @dataclass
@@ -18,102 +22,126 @@ class ChatAnswer:
     sources: list[dict]
     blocked: bool = False
     block_reason: str | None = None
-
-
-def _get_base_url() -> str:
-    return get_settings().ollama_base_url.rstrip("/")
+    refused: bool = False
+    retrieval_mode: str = "hybrid"
+    # Used by the offline evaluator; never included in the API response.
+    retrieved_chunks: list[RetrievedChunk] = field(default_factory=list, repr=False)
 
 
 def _format_block(chunk: RetrievedChunk) -> str:
-    src = chunk.metadata.get("source", "unknown")
-    return f"[source: {src}]\n{chunk.text}"
+    return f"[source: {chunk.metadata['source']}]\n{chunk.text}"
 
 
-def _sources_payload(chunks: list[RetrievedChunk]) -> list[dict]:
+def _sources_payload(chunks: list[RetrievedChunk], answer: str) -> list[dict]:
+    cited_sources = {source.strip() for source in guardrails._CITATIONS.findall(answer)}
     return [
         {
-            "id": c.id,
-            "source": c.metadata.get("source"),
-            "clearance": c.metadata.get("clearance_name"),
-            "tenant_id": c.metadata.get("tenant_id"),
-            "score": round(1.0 - c.distance, 4),
+            "id": chunk.id,
+            "source": chunk.metadata["source"],
+            "clearance": chunk.metadata["clearance_name"],
+            "tenant_id": chunk.metadata["tenant_id"],
+            "score": None if chunk.similarity is None else round(chunk.similarity, 4),
+            "rrf_score": None if chunk.rrf_score is None else round(chunk.rrf_score, 6),
+            "dense_rank": chunk.dense_rank,
+            "keyword_rank": chunk.keyword_rank,
         }
-        for c in chunks
+        for chunk in chunks
+        if chunk.metadata["source"] in cited_sources
     ]
 
 
-def answer_question(user: User, question: str) -> ChatAnswer:
-    # 1. Input guardrail
-    in_check = guardrails.check_input(question)
-    if not in_check.allowed:
-        log_event(
-            "blocked_input",
-            user=user.username, role=user.role, tenant=user.tenant_id,
-            reason=in_check.reason, question=question,
-        )
+def answer_question(
+    user: User,
+    question: str,
+    *,
+    mode: Literal["dense", "hybrid"] | None = None,
+) -> ChatAnswer:
+    settings = get_settings()
+    mode = settings.retrieval_mode if mode is None else mode
+    started = perf_counter()
+    fields = {"user": user.username, "role": user.role, "tenant": user.tenant_id}
+    checked = guardrails.check_input(question)
+    if not checked.allowed:
+        log_event("blocked_input", **fields, reason=checked.reason, question=question)
         return ChatAnswer(
-            answer=in_check.reason or "Request blocked.",
-            sources=[], blocked=True, block_reason=in_check.reason,
+            checked.reason or "Request blocked.",
+            [],
+            blocked=True,
+            block_reason=checked.reason,
+            retrieval_mode=mode,
         )
-
-    # 2. RBAC-scoped retrieval
-    chunks = secure_search(user, question)
+    try:
+        chunks = secure_search(user, question, mode=mode)
+    except OllamaError:
+        log_event("model_error", **fields, stage="embedding")
+        raise
     log_event(
         "retrieval",
-        user=user.username, role=user.role, tenant=user.tenant_id,
+        **fields,
         clearance=user.clearance.name,
         question=question,
-        retrieved=[{"id": c.id, "source": c.metadata.get("source"),
-                    "clearance": c.metadata.get("clearance_name")} for c in chunks],
+        filters=build_access_filter(user),
+        retrieval_mode=mode,
+        retrieval_ms=round((perf_counter() - started) * 1000, 2),
+        retrieved=[
+            {
+                "id": chunk.id,
+                "source": chunk.metadata["source"],
+                "clearance": chunk.metadata["clearance_name"],
+            }
+            for chunk in chunks
+        ],
     )
-
     if not chunks:
-        return ChatAnswer(
-            answer="I don't have access to information that answers that question.",
-            sources=[],
-        )
-
-    # 3. LLM call with hardened system prompt using Ollama
-    messages = guardrails.build_prompt(question, [_format_block(c) for c in chunks])
-    settings = get_settings()
-    
+        return ChatAnswer(guardrails.REFUSAL, [], refused=True, retrieval_mode=mode)
+    messages = guardrails.build_prompt(question, [_format_block(chunk) for chunk in chunks])
     try:
-        base_url = _get_base_url()
-        response = requests.post(
-            f"{base_url}/api/chat",
-            json={
+        data = request_json(
+            "POST",
+            "/api/chat",
+            payload={
                 "model": settings.ollama_chat_model,
                 "messages": messages,
-                "temperature": 0.1,
+                "options": {"temperature": 0.1},
                 "stream": False,
             },
-            timeout=120
+            timeout=settings.ollama_chat_timeout,
         )
-        response.raise_for_status()
-        data = response.json()
-        raw = (data.get("message", {}).get("content", "") or "").strip()
-    except requests.exceptions.RequestException as e:
-        log_event(
-            "llm_error",
-            user=user.username, role=user.role, tenant=user.tenant_id,
-            error=str(e),
-        )
+        message = data.get("message")
+        if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+            raise OllamaError("Ollama returned an invalid chat response")
+        raw = message["content"].strip()
+        if not raw:
+            raise OllamaError("Ollama returned an empty answer")
+    except OllamaError:
+        log_event("model_error", **fields, stage="generation")
+        raise
+    checked = guardrails.filter_output(raw, user)
+    if checked.allowed:
+        checked = guardrails.validate_citations(raw, {chunk.metadata["source"] for chunk in chunks})
+    if not checked.allowed:
+        log_event("blocked_output", **fields, reason=checked.reason)
         return ChatAnswer(
-            answer="Failed to generate response. Please try again.",
-            sources=[], blocked=True, block_reason=str(e),
+            checked.reason or "Response withheld.",
+            [],
+            blocked=True,
+            block_reason=checked.reason,
+            retrieval_mode=mode,
+            retrieved_chunks=chunks,
         )
-
-    # 4. Output guardrail
-    out_check = guardrails.filter_output(raw, user)
-    if not out_check.allowed:
-        log_event(
-            "blocked_output",
-            user=user.username, role=user.role, tenant=user.tenant_id,
-            reason=out_check.reason,
-        )
-        return ChatAnswer(
-            answer=out_check.reason or "Response withheld.",
-            sources=[], blocked=True, block_reason=out_check.reason,
-        )
-
-    return ChatAnswer(answer=out_check.sanitized_text or raw, sources=_sources_payload(chunks))
+    refused = raw == guardrails.REFUSAL
+    sources = [] if refused else _sources_payload(chunks, raw)
+    log_event(
+        "answer",
+        **fields,
+        refused=refused,
+        source_count=len(sources),
+        duration_ms=round((perf_counter() - started) * 1000, 2),
+    )
+    return ChatAnswer(
+        raw,
+        sources,
+        refused=refused,
+        retrieval_mode=mode,
+        retrieved_chunks=chunks,
+    )

@@ -1,0 +1,12 @@
+.git
+.venv
+.env
+chroma_db
+accessmem_users.db*
+audit.log*
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+eval/results
+Screenshot*.png

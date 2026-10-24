@@ -1,21 +1,15 @@
-"""One-shot loader: read ./data, chunk, embed, and upsert to Chroma with the
-right tenant + clearance metadata.
+"""Ingest and synchronize a metadata-tagged text or Markdown corpus."""
 
-Document files use a tiny YAML-ish front matter:
-
-    tenant: acme
-    clearance: CONFIDENTIAL
-    title: Some Title
-    ---
-    ... body ...
-"""
 from __future__ import annotations
 
+import argparse
+import hashlib
 import re
 from pathlib import Path
 
 from .auth.models import Clearance
-from .services.vector_store import add_documents
+from .config import get_settings
+from .services.vector_store import replace_corpus
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CHUNK_CHARS = 800
@@ -23,70 +17,116 @@ CHUNK_OVERLAP = 100
 
 
 def _parse_front_matter(text: str) -> tuple[dict, str]:
-    if "---" not in text:
-        raise ValueError("missing '---' separator")
-    head, body = text.split("---", 1)
-    meta: dict[str, str] = {}
-    for line in head.splitlines():
+    parts = re.split(r"(?m)^---\s*$", text.lstrip("\ufeff"), maxsplit=1)
+    if len(parts) != 2:
+        raise ValueError("Missing front matter separator")
+    metadata: dict[str, str] = {}
+    for line in parts[0].splitlines():
         line = line.strip()
-        if not line or ":" not in line:
+        if not line or line.startswith("#"):
             continue
-        k, v = line.split(":", 1)
-        meta[k.strip().lower()] = v.strip()
-    return meta, body.strip()
+        if ":" not in line:
+            raise ValueError("Invalid front matter line")
+        key, value = line.split(":", 1)
+        key = key.strip().lower()
+        if key in metadata:
+            raise ValueError(f"Duplicate front matter key: {key}")
+        metadata[key] = value.strip()
+    body = parts[1].strip()
+    if not body:
+        raise ValueError("Document body must not be empty")
+    return metadata, body
 
 
 def _chunk(text: str, size: int = CHUNK_CHARS, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) <= size:
-        return [text]
-    chunks: list[str] = []
+    if size < 1 or not 0 <= overlap < size:
+        raise ValueError("Chunk size must be positive and overlap smaller than size")
+    text = text.strip()
+    chunks = []
     start = 0
     while start < len(text):
         end = min(start + size, len(text))
-        chunks.append(text[start:end])
+        if end < len(text):
+            # Prefer a paragraph, line or word boundary in the latter half.
+            for separator in ("\n\n", "\n", " "):
+                boundary = text.rfind(separator, start + size // 2, end)
+                if boundary > start:
+                    end = boundary + len(separator)
+                    break
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
         if end == len(text):
             break
-        start = end - overlap
+        start = max(start + 1, end - overlap)
     return chunks
 
 
-def main() -> None:
-    files = sorted(DATA_DIR.glob("*.md"))
-    if not files:
-        print(f"No .md files found in {DATA_DIR}")
-        return
-
-    ids: list[str] = []
-    texts: list[str] = []
-    metas: list[dict] = []
-
-    for path in files:
+def ingest_directory(directory: Path, *, adopt_legacy: bool = False) -> dict:
+    if not directory.is_dir():
+        raise ValueError(f"Data directory does not exist: {directory}")
+    settings = get_settings()
+    paths = sorted(
+        path
+        for path in directory.iterdir()
+        if path.is_file() and path.suffix.lower() in {".md", ".txt"}
+    )
+    ids, texts, metadatas = [], [], []
+    for path in paths:
         raw = path.read_text(encoding="utf-8")
         meta, body = _parse_front_matter(raw)
         tenant = meta.get("tenant")
-        clearance_name = (meta.get("clearance") or "").upper()
-        title = meta.get("title", path.stem)
-        if not tenant or not clearance_name:
-            raise ValueError(f"{path.name}: missing tenant or clearance")
-        clearance = Clearance.from_name(clearance_name)
-
-        for i, chunk in enumerate(_chunk(body)):
-            ids.append(f"{path.stem}::chunk{i}")
+        if not tenant or not meta.get("clearance"):
+            raise ValueError(f"{path.name}: tenant and clearance are required")
+        try:
+            clearance = Clearance.from_name(meta["clearance"])
+        except KeyError as exc:
+            raise ValueError(f"{path.name}: invalid clearance") from exc
+        document_hash = hashlib.sha256(raw.encode()).hexdigest()
+        for index, chunk in enumerate(_chunk(body, settings.chunk_chars, settings.chunk_overlap)):
+            ids.append(f"{settings.ingest_corpus_id}:{tenant}:{path.stem}::chunk{index}")
             texts.append(chunk)
-            metas.append({
-                "source": path.name,
-                "title": title,
-                "tenant_id": tenant,
-                "clearance_level": int(clearance),
-                "clearance_name": clearance.name,
-                "chunk_index": i,
-            })
-        print(f"  prepared {path.name}  tenant={tenant}  clearance={clearance.name}")
+            metadatas.append(
+                {
+                    "source": path.name,
+                    "title": meta.get("title", path.stem),
+                    "tenant_id": tenant,
+                    "clearance_level": int(clearance),
+                    "clearance_name": clearance.name,
+                    "chunk_index": index,
+                    "corpus_id": settings.ingest_corpus_id,
+                    "document_hash": document_hash,
+                    "content_hash": hashlib.sha256(chunk.encode()).hexdigest(),
+                }
+            )
+    removed = replace_corpus(
+        ids,
+        texts,
+        metadatas,
+        corpus_id=settings.ingest_corpus_id,
+        sources=[path.name for path in paths],
+        adopt_legacy=adopt_legacy,
+    )
+    return {"documents": len(paths), "chunks": len(texts), "replaced_chunks": removed}
 
-    print(f"\nUpserting {len(texts)} chunks from {len(files)} documents...")
-    add_documents(ids, texts, metas)
-    print("Done.")
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Synchronize AccessMem's managed document corpus")
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
+    parser.add_argument(
+        "--adopt-legacy",
+        action="store_true",
+        help="Also replace untagged documents from the original ingestion implementation",
+    )
+    args = parser.parse_args()
+    try:
+        result = ingest_directory(args.data_dir, adopt_legacy=args.adopt_legacy)
+    except (ValueError, RuntimeError) as exc:
+        parser.exit(1, f"Ingestion failed: {exc}\n")
+    print(
+        f"Indexed {result['chunks']} chunks from {result['documents']} documents; "
+        f"replaced {result['replaced_chunks']} existing chunks."
+    )
 
 
 if __name__ == "__main__":

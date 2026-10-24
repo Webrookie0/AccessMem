@@ -1,0 +1,88 @@
+x-backend: &backend
+  build: .
+  env_file: .env
+  environment: &backend-environment
+    OLLAMA_BASE_URL: http://ollama:11434
+    RAGAS_BASE_URL: http://ollama:11434/v1
+    CHROMA_PERSIST_DIR: /data/chroma
+    USER_DATABASE_PATH: /data/users.db
+    AUDIT_LOG_PATH: /data/audit.log
+  volumes:
+    - accessmem_data:/data
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  models:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-qwen2.5-coder:7b}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        ollama pull "$$OLLAMA_CHAT_MODEL"
+        ollama pull "$$OLLAMA_EMBED_MODEL"
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+  ingest:
+    <<: *backend
+    command: ["python", "-m", "app.ingest", "--adopt-legacy"]
+    depends_on:
+      models:
+        condition: service_completed_successfully
+
+  api:
+    <<: *backend
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      ingest:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  ui:
+    build: .
+    command: ["streamlit", "run", "ui/streamlit_app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
+    environment:
+      API_BASE_URL: http://api:8000
+      API_TIMEOUT: "200"
+      DEMO_USERS_ENABLED: ${DEMO_USERS_ENABLED:-true}
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  evaluation:
+    <<: *backend
+    build:
+      context: .
+      args:
+        INSTALL_EVAL: "true"
+    profiles: ["evaluation"]
+    command: ["python", "-m", "eval.run", "--ragas", "--output", "/data/eval/report.json"]
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  accessmem_data:
+  ollama_models:

@@ -1,55 +1,52 @@
-"""Ollama embeddings wrapper."""
-import requests
-from functools import lru_cache
+"""Batched and validated embeddings through Ollama."""
+
+from __future__ import annotations
+
+import math
 
 from ..config import get_settings
-
-
-def _get_base_url() -> str:
-    return get_settings().ollama_base_url.rstrip("/")
+from .ollama import OllamaError, request_json
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Generate embeddings for a list of texts using Ollama."""
     if not texts:
         return []
-    
-    base_url = _get_base_url()
-    model = get_settings().ollama_embed_model
-    
-    embeddings = []
-    for text in texts:
-        try:
-            response = requests.post(
-                f"{base_url}/api/embed",
-                json={"model": model, "input": text},
-                timeout=60
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            # Ollama returns "embeddings" (plural) as a list
-            embedding_list = data.get("embeddings")
-            if not embedding_list or len(embedding_list) == 0:
-                raise RuntimeError(
-                    f"No embeddings in Ollama response. Response: {data}\n"
-                    f"Make sure Ollama is running: ollama serve\n"
-                    f"And model is available: ollama pull {model}"
+    if any(not isinstance(text, str) or not text.strip() for text in texts):
+        raise ValueError("Embedding inputs must be non-empty text")
+    settings = get_settings()
+    embeddings: list[list[float]] = []
+    dimension: int | None = None
+    for start in range(0, len(texts), settings.embedding_batch_size):
+        batch = texts[start : start + settings.embedding_batch_size]
+        data = request_json(
+            "POST",
+            "/api/embed",
+            payload={"model": settings.ollama_embed_model, "input": batch},
+            timeout=settings.ollama_embed_timeout,
+        )
+        vectors = data.get("embeddings")
+        if not isinstance(vectors, list) or len(vectors) != len(batch):
+            raise OllamaError("Ollama returned the wrong number of embeddings")
+        for vector in vectors:
+            if (
+                not isinstance(vector, list)
+                or not vector
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    for value in vector
                 )
-            # Take the first embedding from the list
-            embeddings.append(embedding_list[0])
-        except requests.exceptions.ConnectionError as e:
-            raise RuntimeError(
-                f"Cannot connect to Ollama at {base_url}\n"
-                f"Error: {e}\n"
-                f"Make sure Ollama is running: ollama serve"
-            )
-        except requests.exceptions.RequestException as e:
-            raise RuntimeError(f"Failed to get embedding from Ollama: {e}")
-    
+                or not any(vector)
+            ):
+                raise OllamaError("Ollama returned an invalid embedding")
+            if dimension is None:
+                dimension = len(vector)
+            elif len(vector) != dimension:
+                raise OllamaError("Ollama returned inconsistent embedding dimensions")
+            embeddings.append([float(value) for value in vector])
     return embeddings
 
 
 def embed_query(text: str) -> list[float]:
-    """Generate embedding for a single query text."""
     return embed_texts([text])[0]

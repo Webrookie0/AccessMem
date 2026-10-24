@@ -1,0 +1,30 @@
+name: AccessMem CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+            requirements-eval.txt
+            requirements.lock
+      - run: pip install -r requirements-dev.txt -r requirements-eval.txt
+      - run: ruff check app eval tests ui
+      - run: ruff format --check app eval tests ui
+      - run: pytest
+        env:
+          APP_ENV: test
+          ANONYMIZED_TELEMETRY: "false"
